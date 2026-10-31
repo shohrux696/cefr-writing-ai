@@ -3,16 +3,16 @@ import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from dotenv import load_dotenv
-
-load_dotenv()
+from google import genai
 
 TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+ai = genai.Client(api_key=GEMINI_KEY)
 
-keyboard = ReplyKeyboardMarkup(
+menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="FULL WRITING TOPSHIRISH")],
         [KeyboardButton(text="TASK 1.1"),
@@ -27,14 +27,44 @@ keyboard = ReplyKeyboardMarkup(
 async def start(message: types.Message):
     await message.answer(
         "Assalomu alaykum! CEFR Writing Checker botiga xush kelibsiz.",
-        reply_markup=keyboard
+        reply_markup=menu
     )
 
 @dp.message()
-async def handle_message(message: types.Message):
-    await message.answer(
-        "Yozgan ishingizni yuboring. Tez orada AI tekshiruv tizimi ulanadi."
-    )
+async def check_writing(message: types.Message):
+    if not message.text:
+        await message.answer("Iltimos, writing matnini text shaklida yuboring.")
+        return
+
+    await message.answer("Writing tekshirilmoqda...")
+
+    prompt = f"""
+You are a CEFR writing assessor.
+Evaluate this student's English writing.
+Give:
+1. Estimated CEFR level
+2. Task achievement
+3. Organisation
+4. Vocabulary
+5. Grammar
+6. Main mistakes and corrections
+7. Improved version
+Explain feedback in Uzbek.
+Do not claim this is an official exam score.
+
+Student writing:
+{message.text}
+"""
+
+    try:
+        response = await asyncio.to_thread(
+            ai.models.generate_content,
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        await message.answer(response.text[:4000])
+    except Exception:
+        await message.answer("Xatolik yuz berdi. Keyinroq urinib ko‘ring.")
 
 async def main():
     await dp.start_polling(bot)
