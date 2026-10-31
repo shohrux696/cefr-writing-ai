@@ -1,0 +1,43 @@
+import asyncio
+import os
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="FULL WRITING TOPSHIRISH")],
+        [KeyboardButton(text="TASK 1.1"),
+         KeyboardButton(text="TASK 1.2")],
+        [KeyboardButton(text="FULL MOCK TEST")],
+        [KeyboardButton(text="TASK 2")]
+    ],
+    resize_keyboard=True
+)
+
+@dp.message(CommandStart())
+async def start(message: types.Message):
+    await message.answer(
+        "Assalomu alaykum! CEFR Writing Checker botiga xush kelibsiz.",
+        reply_markup=keyboard
+    )
+
+@dp.message()
+async def handle_message(message: types.Message):
+    await message.answer(
+        "Yozgan ishingizni yuboring. Tez orada AI tekshiruv tizimi ulanadi."
+    )
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
