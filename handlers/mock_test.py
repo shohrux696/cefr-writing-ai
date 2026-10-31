@@ -2,11 +2,12 @@
 
 Flow:
 1. The student starts the mock test; a session with all enabled tasks is created.
-2. The first task opens and gets a deadline (set by the administrator).
-3. The student sends the answer. The task closes, the next task opens,
+2. Before each task opens, a new question is created for it (topics differ inside one session).
+3. The first task opens and gets a deadline (set by the administrator).
+4. The student sends the answer. The task closes, the next task opens,
    and the answer is evaluated.
-4. If a deadline passes, the task closes automatically and the next task opens.
-5. After the last task, the final report is sent.
+5. If a deadline passes, the task closes automatically and the next task opens.
+6. After the last task, the final report is sent.
 
 While a mock test is active, menu buttons are blocked. Only the cancel button,
 /time, and /start, /help commands work.
@@ -19,7 +20,7 @@ import logging
 from aiogram import Bot, F, Router
 from aiogram.filters import BaseFilter, Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Message
 
 import database
 from config import MOCK_TASK_ORDER, SOURCE_MOCK, TASKS
@@ -37,13 +38,18 @@ from keyboards.menus import (
 from services import timer_service
 from services.evaluation_service import (
     EvaluationError,
-    evaluate_text,
     format_result_text,
     get_user_lock,
     load_stored_result,
     task_title,
 )
 from services.gemini_service import is_configured
+from services.question_service import (
+    QuestionError,
+    evaluate_prompted_text,
+    get_question,
+    get_session_prompt,
+)
 from services.timer_service import cancel_timer, format_seconds, schedule_expiry, seconds_left
 from utils.validators import validate_writing
 
@@ -58,6 +64,10 @@ STATUS_UZ: dict[str, str] = {
     "expired": "vaqt tugadi",
 }
 
+OPENED = "opened"
+FINISHED = "finished"
+FAILED = "failed"
+
 
 class ActiveMockFilter(BaseFilter):
     """True when the student has an active mock test session."""
@@ -69,13 +79,13 @@ class ActiveMockFilter(BaseFilter):
         return await database.get_active_mock_session(user.id) is not None
 
 
-def _task_text(task_key: str, position: int, total: int, deadline_iso: str) -> str:
+def _task_text(task_key: str, position: int, total: int, deadline_iso: str, prompt: str) -> str:
     spec = TASKS[task_key]
     remaining = format_seconds(seconds_left(deadline_iso))
     return (
         f"🧪 FULL MOCK TEST — {position + 1}/{total}\n\n"
         f"📝 {spec.title}\n\n"
-        f"{spec.instructions}\n\n"
+        f"{prompt}\n\n"
         f"🔢 Tavsiya etilgan so'zlar: {spec.target_min_words}–{spec.target_max_words}\n"
         f"⏱ Qolgan vaqt: {remaining}\n\n"
         "Javobingizni bitta xabarda yuboring. Yuborilgach topshiriq yopiladi "
@@ -83,16 +93,34 @@ def _task_text(task_key: str, position: int, total: int, deadline_iso: str) -> s
     )
 
 
-async def _open_next_and_schedule(bot: Bot, telegram_id: int, session_id: int) -> bool:
-    """Open the next waiting task and start its timer.
+async def _open_next_and_schedule(bot: Bot, telegram_id: int, session_id: int) -> str:
+    """Create a question for the next waiting task, open it and start its timer.
 
-    Returns False when no tasks are left. In that case the session is finished
-    and the caller must send the final report.
+    Returns OPENED, FINISHED (no tasks left) or FAILED (question could not be created).
+    On FAILED the task stays waiting; the student can cancel the session.
     """
+    tasks = await database.get_mock_tasks(session_id)
+    waiting = next((task for task in tasks if task["status"] == "waiting"), None)
+    if waiting is None:
+        await database.finish_mock_session(session_id)
+        return FINISHED
+
+    try:
+        question = await get_question(telegram_id, waiting["task_type"], session_id=session_id)
+    except QuestionError as exc:
+        logger.warning("Could not create question for mock session %s: %s", session_id, exc)
+        await bot.send_message(
+            telegram_id,
+            f"⚠️ Keyingi topshiriq uchun savol yaratib bo'lmadi: {exc}\n"
+            "❌ Bekor qilish tugmasi bilan testni to'xtating va keyinroq qayta boshlang.",
+            reply_markup=cancel_keyboard(),
+        )
+        return FAILED
+
     opened = await database.open_next_mock_task(session_id)
     if opened is None:
         await database.finish_mock_session(session_id)
-        return False
+        return FINISHED
 
     schedule_expiry(
         task_id=opened["id"],
@@ -100,13 +128,18 @@ async def _open_next_and_schedule(bot: Bot, telegram_id: int, session_id: int) -
         telegram_id=telegram_id,
         deadline_iso=opened["deadline_at"],
     )
-    tasks = await database.get_mock_tasks(session_id)
     await bot.send_message(
         chat_id=telegram_id,
-        text=_task_text(opened["task_type"], opened["position"], len(tasks), opened["deadline_at"]),
+        text=_task_text(
+            opened["task_type"],
+            opened["position"],
+            len(tasks),
+            opened["deadline_at"],
+            question.prompt,
+        ),
         reply_markup=cancel_keyboard(),
     )
-    return True
+    return OPENED
 
 
 async def send_final_report(bot: Bot, telegram_id: int, session_id: int) -> None:
@@ -162,10 +195,11 @@ async def _evaluate_mock_answer(
     telegram_id: int,
     session_id: int,
     task_row,
+    prompt: str,
     text: str,
     word_count: int,
 ) -> None:
-    """Evaluate one submitted mock answer and send the feedback to the student."""
+    """Evaluate one submitted mock answer against its question and send the feedback."""
     task_key = task_row["task_type"]
     task_id = task_row["id"]
     status = await bot.send_message(telegram_id, "⏳ Javobingiz baholanmoqda...")
@@ -182,7 +216,7 @@ async def _evaluate_mock_answer(
             mock_session_id=session_id,
         )
         await database.attach_submission_to_mock_answer(task_id, submission_id)
-        result = await evaluate_text(task_key, text, word_count)
+        result = await evaluate_prompted_text(task_key, prompt, text, word_count)
         await database.save_evaluation(
             submission_id=submission_id,
             estimated_cefr=result["estimated_cefr_level"],
@@ -218,8 +252,8 @@ def build_expiry_handler(bot: Bot):
             telegram_id,
             "⏰ Vaqt tugadi. Bu topshiriq uchun yozilgan matn saqlanmadi, chunki yuborilmagan edi.",
         )
-        has_next = await _open_next_and_schedule(bot, telegram_id, session_id)
-        if not has_next:
+        result = await _open_next_and_schedule(bot, telegram_id, session_id)
+        if result == FINISHED:
             await send_final_report(bot, telegram_id, session_id)
 
     return handle_expiry
@@ -306,16 +340,23 @@ async def on_mock_answer(message: Message, state: FSMContext) -> None:
             return
 
         cancel_timer(open_task["id"])
-        has_next = await _open_next_and_schedule(message.bot, telegram_id, session["id"])
-        await _evaluate_mock_answer(
-            message.bot,
-            telegram_id,
-            session["id"],
-            open_task,
-            validation.cleaned_text,
-            validation.word_count,
-        )
-        if not has_next:
+        prompt = await get_session_prompt(session["id"], open_task["task_type"])
+        next_status = await _open_next_and_schedule(message.bot, telegram_id, session["id"])
+
+        if prompt is None:
+            await message.answer("Bu topshiriq uchun savol topilmadi. Javob baholanmadi.")
+        else:
+            await _evaluate_mock_answer(
+                message.bot,
+                telegram_id,
+                session["id"],
+                open_task,
+                prompt,
+                validation.cleaned_text,
+                validation.word_count,
+            )
+
+        if next_status == FINISHED:
             await send_final_report(message.bot, telegram_id, session["id"])
 
 
@@ -351,6 +392,7 @@ async def on_mock_menu(message: Message, state: FSMContext) -> None:
         lines.append(f"• {TASKS[key].title} — {minutes} daqiqa")
     lines += [
         "",
+        "Har bir topshiriq uchun yangi savol yaratiladi. Savollar bu testda bir-biridan farq qiladi.",
         "⚠️ Vaqt tugagach topshiriq avtomatik yopiladi. Yuborilmagan matn saqlanmaydi.",
         "Yuborilgan javobni o'zgartirib bo'lmaydi.",
         "",
@@ -382,7 +424,9 @@ async def on_mock_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if callback.message is not None:
         await safe_edit_text(callback.message, "✅ Mock test boshlandi. Topshiriqlar quyida.", None)
-    await _open_next_and_schedule(callback.bot, user_id, session_id)
+    result = await _open_next_and_schedule(callback.bot, user_id, session_id)
+    if result == FINISHED:
+        await send_final_report(callback.bot, user_id, session_id)
 
 
 @router.callback_query(F.data == CB_MOCK_CANCEL)
@@ -390,7 +434,4 @@ async def on_mock_start_cancel(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message is not None:
         await safe_edit_text(callback.message, "❌ Mock test bekor qilindi.", None)
-
-
-# Keep InlineKeyboardMarkup imported for type checkers that inspect this module
-_ = InlineKeyboardMarkup
+       
