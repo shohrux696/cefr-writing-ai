@@ -24,12 +24,16 @@ from keyboards.menus import (
 )
 from services.evaluation_service import (
     EvaluationError,
-    evaluate_and_store,
     format_result_text,
     get_user_lock,
     task_title,
 )
 from services.gemini_service import is_configured
+from services.question_service import (
+    QuestionError,
+    evaluate_and_store_prompted,
+    get_question,
+)
 from utils.validators import validate_writing
 
 logger = logging.getLogger(__name__)
@@ -43,8 +47,13 @@ class WritingState(StatesGroup):
     waiting_text = State()
 
 
-async def _enter_writing(message: Message, state: FSMContext, task_key: str) -> None:
-    """Show the task instructions and wait for the student's text."""
+async def _enter_writing(
+    message: Message,
+    state: FSMContext,
+    task_key: str,
+    telegram_id: int,
+) -> None:
+    """Create a new question for this student and wait for the answer."""
     await state.clear()
 
     if not await database.is_task_enabled(task_key):
@@ -62,11 +71,20 @@ async def _enter_writing(message: Message, state: FSMContext, task_key: str) -> 
         return
 
     spec = TASKS[task_key]
+    status = await message.answer("⏳ Yangi savol tayyorlanmoqda. Bir necha soniya kuting...")
+    try:
+        question = await get_question(telegram_id, task_key)
+    except QuestionError as exc:
+        await delete_quietly(status)
+        await message.answer(str(exc), reply_markup=main_menu_keyboard())
+        return
+
+    await delete_quietly(status)
     await state.set_state(WritingState.waiting_text)
-    await state.update_data(task_key=task_key)
+    await state.update_data(task_key=task_key, prompt=question.prompt)
     await message.answer(
         f"📝 {spec.title}\n\n"
-        f"{spec.instructions}\n\n"
+        f"{question.prompt}\n\n"
         f"🔢 Tavsiya etilgan so'zlar soni: {spec.target_min_words}–{spec.target_max_words}\n\n"
         "Javobingizni bitta xabarda yuboring.",
         reply_markup=cancel_keyboard(),
@@ -75,17 +93,17 @@ async def _enter_writing(message: Message, state: FSMContext, task_key: str) -> 
 
 @router.message(F.text == BTN_TASK_11)
 async def on_task_11(message: Message, state: FSMContext) -> None:
-    await _enter_writing(message, state, "task_11")
+    await _enter_writing(message, state, "task_11", message.from_user.id)
 
 
 @router.message(F.text == BTN_TASK_12)
 async def on_task_12(message: Message, state: FSMContext) -> None:
-    await _enter_writing(message, state, "task_12")
+    await _enter_writing(message, state, "task_12", message.from_user.id)
 
 
 @router.message(F.text == BTN_TASK_2)
 async def on_task_2(message: Message, state: FSMContext) -> None:
-    await _enter_writing(message, state, "task_2")
+    await _enter_writing(message, state, "task_2", message.from_user.id)
 
 
 @router.message(F.text == BTN_FULL_SUBMISSION)
@@ -118,14 +136,15 @@ async def on_pick_task(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if callback.message is None:
         return
-    await _enter_writing(callback.message, state, task_key)
+    await _enter_writing(callback.message, state, task_key, callback.from_user.id)
 
 
 @router.message(StateFilter(WritingState.waiting_text), F.text, ~F.text.in_(MAIN_MENU_BUTTONS))
 async def on_writing_text(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     task_key = data.get("task_key")
-    if task_key not in TASKS:
+    prompt = data.get("prompt")
+    if task_key not in TASKS or not prompt:
         await state.clear()
         await message.answer(
             "Topshiriq topilmadi. Iltimos, menyudan qayta tanlang.",
@@ -152,9 +171,10 @@ async def on_writing_text(message: Message, state: FSMContext) -> None:
             "⏳ Matningiz baholanmoqda. Bu bir necha soniya vaqt olishi mumkin..."
         )
         try:
-            _, result = await evaluate_and_store(
+            _, result = await evaluate_and_store_prompted(
                 telegram_id=user_id,
                 task_key=task_key,
+                prompt=prompt,
                 text=validation.cleaned_text,
                 word_count=validation.word_count,
             )
