@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -14,7 +15,7 @@ import database
 from config import BOT_TOKEN, ConfigError, setup_logging, validate_config
 from handlers import admin, history, mock_test, start, writing
 from handlers.mock_test import setup_mock_timers
-from services import timer_service
+from services import question_service, timer_service
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ async def main() -> int:
         return 1
 
     await database.init_db()
+    await question_service.init_question_bank()
 
     bot = Bot(token=BOT_TOKEN)
     dispatcher = Dispatcher(storage=MemoryStorage())
@@ -102,6 +104,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     raise SystemExit(asyncio.run(main()))
