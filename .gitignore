@@ -1,3 +1,28 @@
+# Secrets
 .env
+
+# Database
+*.db
+*.db-journal
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
